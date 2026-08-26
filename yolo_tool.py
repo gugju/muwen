@@ -3,7 +3,7 @@
 """
 YOLO数据集工具箱 —— GUI 主程序
 ================================
-版本: 1.1 (2026-08-26) —— 环境路径自动探测
+版本: 2.0 (2026-08-26) —— 多模型对比训练/抽帧去重/背景图/便利功能
 运行方式: 用带 ultralytics 的 python 环境执行（推荐双击 启动工具.bat）
 
 七个页签对应完整工作流:
@@ -18,6 +18,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, scrolledtext, ttk
 
@@ -27,19 +28,26 @@ APP_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
 DEFAULT_CONFIG = {
-    "version": 1,
+    "version": 2,
     # 环境路径留空 = 首次启动自动探测（find_python_exe / find_labelimg_exe）
     "python_exe": "",
     "labelimg_exe": "",
     "project_root": "",
+    "recent_projects": [],
     "classes_text": "gangzhu",
-    "tab1": {"video_dir": "", "fps": 5.0},
+    "tab1": {"video_dir": "", "fps": 5.0,
+             "dedup_on": False, "dedup_threshold": 90},
     "tab2": {"sample_ratio": 0.2, "inner_train_ratio": 0.7},
-    "tab4": {"model": "yolov8n.pt", "epochs": 300, "imgsz": 224, "batch": 32,
+    "tab4": {"models": ["yolov8n.pt"], "epochs": 300, "imgsz": 224, "batch": 32,
              "patience": 50, "copy_paste": 0.3, "workers": 2, "cache_ram": False},
     "tab5": {"conf": 0.25},
-    "tab6": {"r_train": 0.7, "r_val": 0.2},
+    "tab6": {"r_train": 0.7, "r_val": 0.2, "empty_bg": False},
+    "tab7": {"models": ["yolov8n.pt"], "epochs": 300, "imgsz": 224, "batch": 32,
+             "patience": 50, "copy_paste": 0.3, "workers": 2, "cache_ram": False},
 }
+
+# 预设模型下拉值（多选）
+PRESET_MODELS = ["yolov8n.pt", "yolov8s.pt", "yolo11n.pt", "yolo11s.pt"]
 
 
 # ================================================================ #
@@ -59,10 +67,13 @@ class Config:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 disk = json.load(f)
             for k, v in disk.items():
+                if k == "version":
+                    continue        # 版本号始终以程序内置为准
                 if isinstance(v, dict) and isinstance(self.data.get(k), dict):
                     self.data[k].update(v)   # tab 子字典合并，兼容新增字段
                 else:
                     self.data[k] = v
+            self._migrate_v1()
             self.auto_detect()   # 配置里缺的环境路径用自动探测补齐
         except Exception:
             # 配置损坏：备份后用默认值
@@ -71,6 +82,17 @@ class Config:
             except Exception:
                 pass
             self.auto_detect()
+
+    def _migrate_v1(self):
+        """v1 → v2: 训练页签单值 model 字段 → models 列表"""
+        for key in ("tab4", "tab7"):
+            t = self.data.get(key, {})
+            if isinstance(t, dict) and "model" in t:
+                m = (t.get("model") or "").strip()
+                # 磁盘旧值优先（若为空则保留默认列表）
+                if m:
+                    t["models"] = [m]
+                t.pop("model", None)
 
     def auto_detect(self):
         """python_exe / labelimg_exe 为空时自动探测，让新机器 clone 即用"""
@@ -91,6 +113,12 @@ class Config:
     def __getitem__(self, key):
         return self.data[key]
 
+    def get(self, key, default=None):
+        return self.data.get(key, default)
+
+    def setdefault(self, key, default=None):
+        return self.data.setdefault(key, default)
+
     def __setitem__(self, key, value):
         self.data[key] = value
 
@@ -100,7 +128,10 @@ class Config:
 # ================================================================ #
 
 class JobRunner:
-    """Popen + 读线程 + 队列轮询。GUI 只在主线程碰 tk 对象。"""
+    """
+    Popen + 读线程 + 队列轮询。GUI 只在主线程碰 tk 对象。
+    支持任务队列：连续 start() 会排队逐个执行；stop() 终止当前并清空队列。
+    """
 
     def __init__(self, root, on_line=None, on_exit=None):
         self.root = root
@@ -109,22 +140,43 @@ class JobRunner:
         self.on_line = on_line or (lambda line: None)
         self.on_exit = on_exit or (lambda code: None)
         self.stopped_by_user = False
+        self.pending = []          # [(cmd_list, desc, on_done)] 待执行队列
+        self.desc = ""             # 当前任务描述
+        self.start_time = 0.0      # 当前任务启动时间（用于统计用时）
+        self.last_elapsed = 0.0    # 上一个任务实际耗时（秒）
+        self._on_done = None
 
     @property
     def is_running(self):
         return self.proc is not None and self.proc.poll() is None
 
-    def start(self, cmd_list, on_done=None):
+    @property
+    def queue_len(self):
+        """当前执行中 + 排队中的任务数"""
+        return (1 if self.is_running else 0) + len(self.pending)
+
+    def start(self, cmd_list, desc="", on_done=None):
+        """入队并启动（若当前空闲则立即执行第一个）"""
+        self.pending.append((cmd_list, desc, on_done))
+        if not self.is_running:
+            self._launch_next()
+
+    def _launch_next(self):
+        if not self.pending:
+            return
+        cmd_list, desc, on_done = self.pending.pop(0)
+        self.desc = desc
+        self._on_done = on_done
+        self.stopped_by_user = False
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-        self.stopped_by_user = False
         creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         self.proc = subprocess.Popen(
             cmd_list, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
             env=env, cwd=APP_DIR, creationflags=creationflags)
-        self._on_done = on_done
+        self.start_time = time.time()
 
         def reader():
             try:
@@ -152,14 +204,33 @@ class JobRunner:
         if alive and self.is_running:
             self.root.after(100, self._poll)
         elif not alive:
-            code = self.proc.poll() if self.proc else -1
+            # stdout 关闭 ≠ 进程退出（CUDA 清理等可能延后），
+            # 必须真正 wait() 拿准确退出码，否则会误报 -1 失败
             proc, self.proc = self.proc, None
+            if proc is not None:
+                try:
+                    code = proc.wait(timeout=10)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                    code = -1
+            else:
+                code = -1
+            self.last_elapsed = time.time() - self.start_time
             self.on_exit(code if code is not None else -1)
+            # 队列续跑（用户主动停止则清空不续）
+            if not self.stopped_by_user and self.pending:
+                self._launch_next()
 
     def stop(self):
+        """终止当前任务并清空队列（多模型排队时一键全停）"""
         if not self.proc:
+            self.pending.clear()
             return
         self.stopped_by_user = True
+        self.pending.clear()
 
         def killer():
             try:
@@ -196,6 +267,8 @@ class App(tk.Tk):
         self.train_tabs_meta = {}        # tab4/tab7 -> yaml kind
         self._last_save_dir = ""
         self._on_done_hook = None
+        self._train_batch = None         # 多模型对比: [{model, save_dir, elapsed}]
+        self._batch_running = False
 
         self._build_ui()
         self._load_config_to_widgets()
@@ -245,45 +318,72 @@ class App(tk.Tk):
         c["classes_text"] = self.txt_classes.get("1.0", tk.END).strip()
         c["labelimg_exe"] = self.var_labelimg.get().strip()
         c["tab1"].update({"video_dir": self.var_video_dir.get().strip(),
-                          "fps": float(self.var_fps.get())})
+                          "fps": float(self.var_fps.get()),
+                          "dedup_on": bool(self.var_dedup.get()),
+                          "dedup_threshold": float(self.var_dedup_th.get())})
         c["tab2"].update({"sample_ratio": float(self.var_sample.get()),
                           "inner_train_ratio": float(self.var_inner.get())})
-        t4 = getattr(self, "tab4_vars")
-        c["tab4"].update({
-            "model": t4["model"].get().strip(),
-            "epochs": int(t4["epochs"].get()), "imgsz": int(t4["imgsz"].get()),
-            "batch": int(t4["batch"].get()),
-            "patience": int(t4["patience"].get()),
-            "copy_paste": float(t4["copy_paste"].get()),
-            "workers": int(t4["workers"].get()),
-            "cache_ram": bool(t4["cache"].get())})
+        for key in ("tab4", "tab7"):
+            v = getattr(self, f"{key}_vars", None)
+            if v is None:
+                continue
+            c[key].update({
+                "models": self._collect_models(v),
+                "epochs": int(v["epochs"].get()),
+                "imgsz": int(v["imgsz"].get()),
+                "batch": int(v["batch"].get()),
+                "patience": int(v["patience"].get()),
+                "copy_paste": float(v["copy_paste"].get()),
+                "workers": int(v["workers"].get()),
+                "cache_ram": bool(v["cache"].get())})
         c["tab5"].update({"conf": float(self.var_conf.get())})
         c["tab6"].update({"r_train": float(self.var_rtrain.get()),
-                          "r_val": float(self.var_rval.get())})
+                          "r_val": float(self.var_rval.get()),
+                          "empty_bg": bool(self.var_empty_bg.get())})
+        # 最近项目历史（去重置顶，最多5个）
+        root = c["project_root"]
+        recents = c.setdefault("recent_projects", [])
+        if root and root in recents:
+            recents.remove(root)
+        if root:
+            recents.insert(0, root)
+        c["recent_projects"] = recents[:5]
+        self.cb_root["values"] = c["recent_projects"]
         self.cfg.save()
 
     def _load_config_to_widgets(self):
         c = self.cfg
         self.var_root.set(c["project_root"])
+        self.cb_root["values"] = c.get("recent_projects", [])
         self.txt_classes.delete("1.0", tk.END)
         self.txt_classes.insert(tk.END, c["classes_text"])
         self.var_labelimg.set(c["labelimg_exe"])
         t1, t2 = c["tab1"], c["tab2"]
         self.var_video_dir.set(t1["video_dir"])
         self.var_fps.set(t1["fps"])
+        self.var_dedup.set(bool(t1.get("dedup_on", False)))
+        self.var_dedup_th.set(t1.get("dedup_threshold", 90))
         self.var_sample.set(t2["sample_ratio"])
         self.var_inner.set(t2["inner_train_ratio"])
-        t4 = c["tab4"]
-        tv4 = self.tab4_vars
-        tv4["model"].set(t4["model"])
-        for k in ("epochs", "imgsz", "batch", "patience",
-                  "copy_paste", "workers"):
-            tv4[k].set(t4[k])
-        tv4["cache"].set(bool(t4["cache_ram"]))
+        for key in ("tab4", "tab7"):
+            t = c.get(key, {})
+            v = getattr(self, f"{key}_vars")
+            saved = t.get("models", []) or []
+            for m, var in v["model_cbs"]:
+                var.set(m in saved)
+            v["custom"].set(",".join(x for x in saved
+                                     if x not in PRESET_MODELS))
+            for k in ("epochs", "imgsz", "batch", "patience",
+                      "copy_paste", "workers"):
+                v[k].set(t.get(k, DEFAULT_CONFIG[key][k]))
+            v["cache"].set(bool(t.get("cache_ram", False)))
         self.var_conf.set(c["tab5"]["conf"])
         t6 = c["tab6"]
         self.var_rtrain.set(t6["r_train"])
         self.var_rval.set(t6["r_val"])
+        self.var_empty_bg.set(bool(t6.get("empty_bg", False)))
+        self._update_preview2()
+        self._update_preview6()
 
     # 路径派生辅助
     def p_root(self):
@@ -338,9 +438,10 @@ class App(tk.Tk):
         top.pack(side=tk.TOP, fill=tk.X)
         ttk.Label(top, text="项目根目录:").pack(side=tk.LEFT)
         self.var_root = tk.StringVar()
-        ttk.Entry(top, textvariable=self.var_root).pack(
-            side=tk.LEFT, fill=tk.X, expand=True, padx=4)
+        self.cb_root = ttk.Combobox(top, textvariable=self.var_root, width=60)
+        self.cb_root.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=4)
         ttk.Button(top, text="浏览…", command=self.browse_root).pack(side=tk.LEFT)
+        self.var_root.trace_add("write", lambda *a: self._on_root_changed())
 
         nb = ttk.Notebook(self)
         nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=6, pady=3)
@@ -401,6 +502,18 @@ class App(tk.Tk):
         ttk.Spinbox(row, from_=0.5, to=30, increment=0.5, width=8,
                     textvariable=self.var_fps).pack(side=tk.LEFT)
 
+        dedup_row = ttk.Frame(lf)
+        dedup_row.pack(fill=tk.X, pady=2)
+        self.var_dedup = tk.BooleanVar(value=False)
+        ttk.Checkbutton(dedup_row, text="相似帧去重（相邻几乎相同的帧自动跳过）",
+                        variable=self.var_dedup).pack(side=tk.LEFT)
+        ttk.Label(dedup_row, text="阈值:").pack(side=tk.LEFT, padx=(10, 2))
+        self.var_dedup_th = tk.DoubleVar(value=90)
+        ttk.Spinbox(dedup_row, from_=50, to=100, increment=5, width=6,
+                    textvariable=self.var_dedup_th).pack(side=tk.LEFT)
+        ttk.Label(dedup_row, text="% (越大越严格，100=仅跳过完全相同)").pack(
+            side=tk.LEFT, padx=4)
+
         bf = ttk.Frame(f, padding=(0, 8))
         bf.pack(fill=tk.X)
         self.btn_extract = ttk.Button(bf, text="开始抽帧 ▶",
@@ -434,11 +547,17 @@ class App(tk.Tk):
         self.save_config_from_widgets()
         self.status_var.set("正在抽帧…")
         self.set_busy(True, "extract")
-        self.log(f"▶ 开始抽帧: {video_dir} @ {fps}帧/秒 → {out_dir}")
-        self.runner.start([self.cfg["python_exe"],
-                           os.path.join(APP_DIR, "tool_core.py"),
-                           "--job", "extract", "--video_dir", video_dir,
-                           "--out_dir", out_dir, "--fps", str(fps)])
+        dedup = bool(self.var_dedup.get())
+        dedup_txt = f"，去重阈值{self.var_dedup_th.get():g}%" if dedup else ""
+        self.log(f"▶ 开始抽帧: {video_dir} @ {fps}帧/秒{dedup_txt} → {out_dir}")
+        cmd = [self.cfg["python_exe"],
+               os.path.join(APP_DIR, "tool_core.py"),
+               "--job", "extract", "--video_dir", video_dir,
+               "--out_dir", out_dir, "--fps", str(fps)]
+        if dedup:
+            cmd += ["--dedup", "1",
+                    "--dedup_threshold", str(self.var_dedup_th.get())]
+        self.runner.start(cmd, desc="抽帧")
 
     # ---------- 页签② 抽取20% ---------- #
 
@@ -476,6 +595,12 @@ class App(tk.Tk):
                                      command=self.on_move20)
         self.btn_move20.pack(side=tk.LEFT)
         self.start_buttons.append(self.btn_move20)
+
+        self.var_preview2 = tk.StringVar(value="（完成抽帧后自动显示预计抽取数量）")
+        ttk.Label(f, textvariable=self.var_preview2, foreground="#06c",
+                  wraplength=800, justify=tk.LEFT).pack(anchor=tk.W, pady=2)
+        self.var_sample.trace_add("write", lambda *a: self._update_preview2())
+        self.var_inner.trace_add("write", lambda *a: self._update_preview2())
 
         tip = ("说明：从 <项目根>/images_all 随机移动抽取比例的图片到 "
                "<项目根>/dataset/images/{train,val}，并创建 labels 文件夹与 classes.txt。\n"
@@ -640,12 +765,22 @@ class App(tk.Tk):
 
         row0 = ttk.Frame(lf)
         row0.pack(fill=tk.X, pady=2)
-        ttk.Label(row0, text="模型:", width=14).pack(side=tk.LEFT)
-        var_model = tk.StringVar(value="yolov8n.pt")
-        ttk.Combobox(row0, textvariable=var_model, width=22,
-                     values=["yolov8n.pt", "yolov8s.pt", "yolo11n.pt",
-                             "yolo11s.pt"]).pack(side=tk.LEFT)
-        ttk.Label(row0, text="(可手动输入其他模型名)").pack(side=tk.LEFT, padx=6)
+        ttk.Label(row0, text="模型(可多选):", width=14).pack(side=tk.LEFT)
+        model_cbs = []
+        for m in PRESET_MODELS:
+            var = tk.BooleanVar(value=False)
+            cb = ttk.Checkbutton(row0, text=m.replace(".pt", ""),
+                                 variable=var)
+            cb.pack(side=tk.LEFT, padx=3)
+            model_cbs.append((m, var))
+        row_custom = ttk.Frame(lf)
+        row_custom.pack(fill=tk.X, pady=2)
+        ttk.Label(row_custom, text="自定义:", width=14).pack(side=tk.LEFT)
+        var_custom = tk.StringVar()
+        ttk.Entry(row_custom, textvariable=var_custom, width=30).pack(
+            side=tk.LEFT, padx=4)
+        ttk.Label(row_custom, text="(逗号分隔，可填本地路径,如 D:/xx/best.pt)",
+                  foreground="#666").pack(side=tk.LEFT)
 
         grid = ttk.Frame(lf)
         grid.pack(fill=tk.X, pady=4)
@@ -697,11 +832,21 @@ class App(tk.Tk):
         self.stop_buttons[key] = btn_stop
 
         setattr(self, f"{key}_vars", {
-            "model": var_model, "epochs": v_epochs, "imgsz": v_imgsz,
+            "model_cbs": model_cbs, "custom": var_custom,
+            "epochs": v_epochs, "imgsz": v_imgsz,
             "batch": v_batch, "patience": v_patience, "copy_paste": v_cp,
             "workers": v_workers, "cache": v_cache, "yaml": var_yaml})
         btn_start.configure(command=lambda: self.on_train(key))
         self.train_tabs_meta[key] = yaml_kind
+
+    def _collect_models(self, v):
+        """收集勾选的预设模型 + 自定义输入，去重保序"""
+        models = [m for m, var in v["model_cbs"] if var.get()]
+        for x in v["custom"].get().split(","):
+            x = x.strip()
+            if x and x not in models:
+                models.append(x)
+        return models
 
     def _yaml_path_for(self, kind):
         root = self.p_root()
@@ -715,6 +860,46 @@ class App(tk.Tk):
         for key in self.train_tabs_meta:
             getattr(self, f"{key}_vars")["yaml"].set(
                 self._yaml_path_for(self.train_tabs_meta[key]))
+
+    def _on_root_changed(self):
+        """项目根目录变更：刷新派生路径显示与数量预览"""
+        self.refresh_yaml_labels()
+        self._update_preview2()
+        self._update_preview6()
+
+    # —— 数量实时预览 ——
+
+    def _update_preview2(self):
+        root = self.p_root()
+        if not root or not os.path.isdir(os.path.join(root, "images_all")):
+            self.var_preview2.set("（完成抽帧后自动显示预计抽取数量）")
+            return
+        n = len(core.list_images(os.path.join(root, "images_all")))
+        sample = float(self.var_sample.get())
+        inner = float(self.var_inner.get())
+        s = max(1, int(n * sample))
+        t = max(1, int(s * inner))
+        self.var_preview2.set(
+            f"当前 images_all 共 {n} 张 → 预计抽取 {s} 张"
+            f"（train {t} / val {s - t}，剩余 {n - s} 张留待预测）")
+
+    def _update_preview6(self):
+        root = self.p_root()
+        if not root:
+            self.var_preview6.set("")
+            return
+        imgs = os.path.join(root, "images_all")
+        lbls = os.path.join(root, "rest_labels")
+        n = len(core.list_images(imgs)) if os.path.isdir(imgs) else 0
+        pairs, missing = ([], [])
+        if n:
+            pairs, missing = core.pair_images_labels(imgs, lbls)
+        rt, rv = float(self.var_rtrain.get()), float(self.var_rval.get())
+        total = len(pairs)
+        tr, va = int(total * rt), int(total * rv)
+        self.var_preview6.set(
+            f"当前配对 {total} 对 / 缺标签 {len(missing)} 张 → "
+            f"预计 train {tr} / val {va} / test {total - tr - va}")
 
     def on_train(self, key):
         root = self.require_root()
@@ -750,26 +935,63 @@ class App(tk.Tk):
             return
 
         v = getattr(self, f"{key}_vars")
-        model = v["model"].get().strip()
-        if not model:
-            messagebox.showerror("错误", "模型名不能为空")
+        models = self._collect_models(v)
+        if not models:
+            messagebox.showerror("错误", "请至少勾选一个模型，或在自定义栏填写模型名")
             return
         self.save_config_from_widgets()
-        self.status_var.set(f"训练中 {model} …")
+        # 多模型对比批次记录
+        self._train_batch = [{"model": m, "save_dir": "", "elapsed": 0.0,
+                              "ok": False} for m in models]
+        self._batch_running = True
+        self.status_var.set(f"训练中 {models[0]} (1/{len(models)})")
         self.set_busy(True, key)
-        self.log(f"▶ 开始训练: {model} → {yaml_path}")
-        cmd = [self.cfg["python_exe"], os.path.join(APP_DIR, "tool_core.py"),
-               "--job", "train",
-               "--data", yaml_path, "--model", model,
-               "--project_root", root,
-               "--epochs", str(v["epochs"].get()),
-               "--imgsz", str(v["imgsz"].get()),
-               "--batch", str(v["batch"].get()),
-               "--patience", str(v["patience"].get()),
-               "--copy_paste", str(v["copy_paste"].get()),
-               "--workers", str(v["workers"].get()),
-               "--cache_ram", "1" if v["cache"].get() else "0"]
-        self.runner.start(cmd)
+        self.log(f"▶ 加入训练队列 {len(models)} 个模型: {', '.join(models)}")
+        self.log(f"  数据集: {yaml_path}")
+        for i, model in enumerate(models, 1):
+            cmd = [self.cfg["python_exe"],
+                   os.path.join(APP_DIR, "tool_core.py"),
+                   "--job", "train",
+                   "--data", yaml_path, "--model", model,
+                   "--project_root", root,
+                   "--epochs", str(v["epochs"].get()),
+                   "--imgsz", str(v["imgsz"].get()),
+                   "--batch", str(v["batch"].get()),
+                   "--patience", str(v["patience"].get()),
+                   "--copy_paste", str(v["copy_paste"].get()),
+                   "--workers", str(v["workers"].get()),
+                   "--cache_ram", "1" if v["cache"].get() else "0"]
+            self.runner.start(cmd, desc=f"训练 {model} ({i}/{len(models)})",
+                              on_done=self._on_train_job_done)
+
+    def _on_train_job_done(self):
+        """单个模型训练收尾：记录完成状态（save_dir 已在 SAVE_DIR 行记录）"""
+        pass  # 完成状态在 _on_job_exit 统一处理
+
+    def _print_training_summary(self):
+        """多模型训练结束后输出对比汇总表"""
+        batch = self._train_batch or []
+        self.log("=" * 64)
+        self.log("多模型训练对比汇总:")
+        self.log(f"{'模型':<16}{'best mAP50':>12}{'mAP50-95':>12}{'用时':>10}")
+        for item in batch:
+            m = item["model"]
+            if not item["ok"] or not item["save_dir"]:
+                self.log(f"{m:<16}{'失败/未完成':>34}")
+                continue
+            r = core.read_results_summary(item["save_dir"])
+            if not r:
+                self.log(f"{m:<16}  (无 results.csv)")
+                continue
+            mAP50 = r.get("metrics/mAP50(B)")
+            mAP95 = r.get("metrics/mAP50-95(B)")
+            try:
+                self.log(f"{m:<16}{mAP50:>12.3f}{mAP95:>12.3f}"
+                         f"{item['elapsed']:>9.1f}s")
+            except (TypeError, ValueError):
+                self.log(f"{m:<16}  (指标读取异常)")
+        self.log("=" * 64)
+        self.log("提示: 结果目录已保存各模型 best.pt 与曲线，可点『打开结果文件夹』查看")
 
     def open_result_dir(self):
         root = self.require_root()
@@ -923,6 +1145,20 @@ class App(tk.Tk):
                     textvariable=self.var_rval).pack(side=tk.LEFT, padx=4)
         ttk.Label(row, text="test = 余数").pack(side=tk.LEFT, padx=6)
 
+        bg_row = ttk.Frame(lf2)
+        bg_row.pack(fill=tk.X, pady=2)
+        self.var_empty_bg = tk.BooleanVar(value=False)
+        ttk.Checkbutton(bg_row, text="无检出图片当背景图纳入（生成空标签）",
+                        variable=self.var_empty_bg).pack(side=tk.LEFT)
+        ttk.Label(bg_row, text="⚠ 风险: 若图中实际有目标但漏检，会被教成背景",
+                  foreground="#c0392b").pack(side=tk.LEFT, padx=6)
+
+        self.var_preview6 = tk.StringVar(value="")
+        ttk.Label(f, textvariable=self.var_preview6, foreground="#06c",
+                  wraplength=800, justify=tk.LEFT).pack(anchor=tk.W, pady=2)
+        self.var_rtrain.trace_add("write", lambda *a: self._update_preview6())
+        self.var_rval.trace_add("write", lambda *a: self._update_preview6())
+
         bf = ttk.Frame(f, padding=(0, 4))
         bf.pack(fill=tk.X)
         self.btn_split = ttk.Button(bf, text="执行最终划分 ▶",
@@ -990,13 +1226,15 @@ class App(tk.Tk):
         self.save_config_from_widgets()
         self.status_var.set("正在最终划分…")
         self.set_busy(True)
-        self.log(f"▶ 最终划分: {imgs} + {lbls} → {out} ({rt:g}/{rv:g}/余)")
+        empty_bg = bool(self.var_empty_bg.get())
+        self.log(f"▶ 最终划分: {imgs} + {lbls} → {out} ({rt:g}/{rv:g}/余)"
+                 + ("，无检出图当背景纳入" if empty_bg else ""))
 
         def work():
             code = 0
             core.log_hook = lambda m: self.root.after(0, self.log, m)
             try:
-                core.run_split(imgs, lbls, out, rt, rv)
+                core.run_split(imgs, lbls, out, rt, rv, empty_bg=empty_bg)
             except core.JobError as e:
                 self.log(f"JOB_ERROR: {e}", error=True)
                 code = 2
@@ -1027,7 +1265,15 @@ class App(tk.Tk):
             self.status_var.set(line)
             return
         if line.startswith("SAVE_DIR:"):
-            self._last_save_dir = line.split(":", 1)[1].strip()
+            save_dir = line.split(":", 1)[1].strip()
+            self._last_save_dir = save_dir
+            # 记录到多模型对比批次中的当前模型
+            if self._train_batch and self.runner.desc.startswith("训练 "):
+                model = self.runner.desc.split(" (")[0][len("训练 "):].strip()
+                for item in self._train_batch:
+                    if item["model"] == model and not item["save_dir"]:
+                        item["save_dir"] = save_dir
+                        break
             return
         if "JOB_ERROR:" in line:
             self.log(line, error=True)
@@ -1035,6 +1281,28 @@ class App(tk.Tk):
         self.log(line)
 
     def _on_job_exit(self, code):
+        # —— 训练队列批次：记录完成情况，队列没空则继续（保持 busy）——
+        if self._train_batch and self.runner.desc.startswith("训练 "):
+            model = self.runner.desc.split(" (")[0][len("训练 "):].strip()
+            for item in self._train_batch:
+                if item["model"] == model and not item["ok"]:
+                    item["ok"] = (code == 0)
+                    item["elapsed"] = self.runner.last_elapsed
+                    break
+            if code == 0:
+                self.log(f"✔ {model} 训练完成 ({self.runner.last_elapsed:.1f}s)")
+            else:
+                self.log(f"✘ {model} 训练{'被停止' if self.runner.stopped_by_user else '失败'}"
+                         f" (exit={code})", error=True)
+            if self.runner.pending:
+                nxt = self.runner.pending[0][1]
+                pos = self.runner.queue_len
+                total = len(self._train_batch)
+                self.status_var.set(f"训练中 {nxt} ({pos}/{total})")
+                self.log(f"队列中下一个: {nxt} ({pos}/{total})")
+                return   # 队列继续，按钮保持禁用
+
+        # —— 常规任务 / 批次结束 ——
         self.set_busy(False)
         self.status_var.set("空闲")
         if code == 0:
@@ -1051,6 +1319,12 @@ class App(tk.Tk):
             reason = "被用户停止" if self.runner.stopped_by_user else \
                      f"失败 (exit={code})"
             self.log(f"✘ 任务{reason}", error=True)
+
+        # 多模型批次全部结束 → 输出对比汇总
+        if self._train_batch:
+            self._print_training_summary()
+            self._train_batch = None
+            self._batch_running = False
 
     # ---------- 关闭保护 ---------- #
 

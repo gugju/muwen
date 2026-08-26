@@ -3,7 +3,7 @@
 """
 YOLO数据集工具箱 —— 核心逻辑层
 =================================
-版本: 1.1 (2026-08-26) —— 环境路径自动探测
+版本: 2.0 (2026-08-26) —— 多模型对比训练/抽帧去重/背景图/便利功能
 既可被 yolo_tool.py (GUI) 导入复用，也可独立命令行运行：
 
     python tool_core.py --job extract --video_dir X --out_dir Y --fps 5
@@ -198,13 +198,28 @@ def _open_video(path):
 # 步骤① 视频抽帧
 # ---------------------------------------------------------------- #
 
-def run_extract(video_dir, out_dir, fps_extract, progress_every=200):
+def _thumb64(frame):
+    """灰度 + 缩放到 64x64，用于相似帧去重比较"""
+    import cv2
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.resize(gray, (64, 64))
+
+
+def run_extract(video_dir, out_dir, fps_extract, progress_every=200,
+                dedup=False, dedup_threshold=90.0):
     """
     把 video_dir 下每个视频按每秒 fps_extract 帧抽样保存为 jpg 到 out_dir。
     命名规则与用户原有 extract_frames.py 保持一致: <视频名>_<5位序号>.jpg
+
+    dedup=True 时启用相似帧去重：与上一个【保留】帧比较灰度缩略图，
+    相似度=(1-平均绝对差/255)*100，≥ dedup_threshold(0~100) 视为重复丢弃。
+    阈值=100 时只有完全相同才丢弃，等效不去重。
     """
     import cv2
+    import numpy as np
 
+    if dedup and not (0.0 <= dedup_threshold <= 100.0):
+        raise JobError(f"去重阈值不合法: {dedup_threshold} (应为 0~100)")
     if fps_extract is None or fps_extract <= 0:
         raise JobError(f"每秒抽帧数不合法: {fps_extract}")
     if not os.path.isdir(video_dir):
@@ -217,6 +232,7 @@ def run_extract(video_dir, out_dir, fps_extract, progress_every=200):
 
     total_saved = 0
     processed_all = 0
+    total_dedup = 0
     t0 = time.time()
 
     for vi, vname in enumerate(videos, 1):
@@ -235,14 +251,28 @@ def run_extract(video_dir, out_dir, fps_extract, progress_every=200):
             frame_interval = 1
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-        log(f"▶ [{vi}/{len(videos)}] {vname} (原帧率{src_fps:.1f}, 每{frame_interval}帧取1张)")
+        log(f"▶ [{vi}/{len(videos)}] {vname} (原帧率{src_fps:.1f}, 每{frame_interval}帧取1张"
+            + (f", 去重阈值{dedup_threshold:.0f}%" if dedup else "") + ")")
         saved_count = 0
+        last_thumb = None
         frame_index = 0
         while True:
             ret, frame = cap.read()
             if not ret:
                 break
             if frame_index % frame_interval == 0:
+                if dedup and last_thumb is not None:
+                    thumb = _thumb64(frame)
+                    diff = float(np.mean(np.abs(
+                        thumb.astype(np.int16) - last_thumb.astype(np.int16)))) / 255.0
+                    if (1.0 - diff) * 100.0 >= dedup_threshold:
+                        total_dedup += 1
+                        frame_index += 1
+                        processed_all += 1
+                        continue
+                    last_thumb = thumb
+                elif dedup:
+                    last_thumb = _thumb64(frame)
                 img_name = f"{stem}_{saved_count + 1:05d}.jpg"
                 save_frame(frame, os.path.join(out_dir, img_name))
                 saved_count += 1
@@ -255,7 +285,8 @@ def run_extract(video_dir, out_dir, fps_extract, progress_every=200):
         log(f"  ✔ {vname}: 共保存 {saved_count} 张")
 
     secs = time.time() - t0
-    log(f"＝ 抽帧完成: {len(videos)} 个视频 → {total_saved} 张图片 ({secs:.1f}s)")
+    dedup_txt = f"，去重跳过 {total_dedup} 帧" if dedup else ""
+    log(f"＝ 抽帧完成: {len(videos)} 个视频 → {total_saved} 张图片{dedup_txt} ({secs:.1f}s)")
     log(f"  输出目录: {out_dir}")
 
 
@@ -368,11 +399,15 @@ def pair_images_labels(images_dir, labels_dir):
 # ---------------------------------------------------------------- #
 
 def run_split(images_dir, labels_dir, out_root,
-              r_train=0.7, r_val=0.2):
+              r_train=0.7, r_val=0.2, empty_bg=False):
     """
     将 images_dir + labels_dir 的配对样本【复制】划分为:
         out_root/{images,labels}/{train,val,test}
     比例 r_train / r_val / 其余为 test。原件不动。
+
+    empty_bg=True 时：没有标签的图片（预测没检出目标）生成 0 字节空 txt，
+    YOLO 训练视空标签为纯背景负样本，可提升精确率。
+    注意风险：若图中实际有目标但第一轮漏检，会被教成背景。
     """
     r_test = 1.0 - r_train - r_val
     if r_test < -1e-9:
@@ -395,6 +430,20 @@ def run_split(images_dir, labels_dir, out_root,
                 made_any = True
     if made_any:
         raise JobError(f"输出目录已有内容，请先删除或改名后再划分:\n  {out_root}")
+
+    if empty_bg:
+        # 无检出图片当背景样本：在标签目录生成空 txt，随图一起复制进 final_dataset
+        os.makedirs(labels_dir, exist_ok=True)
+        made = 0
+        for img_name in list_images(images_dir):
+            stem = os.path.splitext(img_name)[0]
+            lbl = os.path.join(labels_dir, stem + ".txt")
+            if not os.path.isfile(lbl):
+                with open(lbl, "w", encoding="utf-8"):
+                    pass
+                made += 1
+        if made:
+            log(f"[背景图] 为 {made} 张无检出图片生成空标签（当背景样本纳入）")
 
     pairs, missing = pair_images_labels(images_dir, labels_dir)
     if not pairs:
@@ -544,6 +593,32 @@ def collect_best_pt(search_root):
     return [p for _, p in hits]
 
 
+def read_results_summary(save_dir):
+    """
+    读取训练 run 的 results.csv 末行指标，返回 dict（列名→数值）。
+    文件不存在或格式异常返回 None。用于多模型对比汇总。
+    """
+    csv_path = os.path.join(save_dir, "results.csv")
+    if not os.path.isfile(csv_path):
+        return None
+    try:
+        with open(csv_path, encoding="utf-8") as f:
+            lines = [ln for ln in f if ln.strip()]
+        if len(lines) < 2:
+            return None
+        header = [h.strip() for h in lines[0].split(",")]
+        last = lines[-1].split(",")
+        out = {}
+        for h, v in zip(header, last):
+            try:
+                out[h] = float(v.strip())
+            except ValueError:
+                out[h] = v.strip()
+        return out
+    except Exception:
+        return None
+
+
 # ---------------------------------------------------------------- #
 # 命令行入口（子进程 job 分发）
 # ---------------------------------------------------------------- #
@@ -557,6 +632,10 @@ def main():
     g1.add_argument("--video_dir")
     g1.add_argument("--out_dir")
     g1.add_argument("--fps", type=float, default=5.0)
+    g1.add_argument("--dedup", type=int, default=0,
+                    help="1=启用相似帧去重")
+    g1.add_argument("--dedup_threshold", type=float, default=90.0,
+                    help="去重相似度阈值 0~100 (默认90)")
 
     g2 = ap.add_argument_group("train")
     g2.add_argument("--data")
@@ -583,7 +662,9 @@ def main():
         if args.job == "extract":
             if not args.video_dir or not args.out_dir:
                 raise JobError("extract 需要 --video_dir 和 --out_dir")
-            run_extract(args.video_dir, args.out_dir, args.fps)
+            run_extract(args.video_dir, args.out_dir, args.fps,
+                        dedup=bool(args.dedup),
+                        dedup_threshold=args.dedup_threshold)
         elif args.job == "train":
             if not args.data or not args.project_root:
                 raise JobError("train 需要 --data 和 --project_root")

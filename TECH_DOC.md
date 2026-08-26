@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **版本** | 1.1（2026-08-26）—— 新增环境路径自动探测 |
+| **版本** | 2.0（2026-08-26）—— 多模型对比/去重/背景图/便利功能 |
 | **作者** | muwen（由 Claude Code 协助开发） |
 | **用途** | 一站式 YOLO 检测数据集制作 + 训练 GUI 工具 |
 | **技术栈** | Python 3.11 / tkinter / ultralytics 8.4.49 / OpenCV 4.11 |
@@ -112,11 +112,20 @@ stdout 行协议：
 
 | 类 | 位置 | 职责 |
 |---|---|---|
-| `App(tk.Tk)` | yolo_tool.py | 全部 UI 与事件；`start_buttons` 列表实现任务互斥 |
-| `JobRunner` | yolo_tool.py | Popen 生命周期；`stop()` 先 terminate 3 秒后 kill；`stopped_by_user` 区分人为停止与失败 |
-| `Config` | yolo_tool.py | config.json 读写；损坏时备份 `.bak` 后重建默认 |
+| `App(tk.Tk)` | yolo_tool.py | 全部 UI 与事件；`start_buttons` 列表实现任务互斥；多模型批次状态 `_train_batch` |
+| `JobRunner` | yolo_tool.py | Popen 生命周期 + **任务队列**（`pending` 列表，串行执行）；`stop()` 终止当前并清空队列；`last_elapsed` 记录单任务耗时；`stopped_by_user` 区分人为停止与失败 |
+| `Config` | yolo_tool.py | config.json 读写；损坏时备份 `.bak` 后重建默认；v1→v2 自动迁移（`model` 单值 → `models` 列表） |
 
 `tool_core.py` 顶层只 import 标准库——cv2/numpy/ultralytics 在各函数内部延迟导入，保证 GUI 进程零第三方依赖。
+
+### 4.4 JobRunner 队列协议（v2.0）
+
+多模型排队 = GUI 层 for 循环逐个 `runner.start(cmd, desc, on_done)`：
+- 空闲时立即启动第一个，其余入 `pending` 队列；上一个退出后自动续跑
+- `desc` 格式约定 `"训练 {模型名} (i/N)"`，App 用 `runner.desc` 关联当前批次项
+- **退出码读取时机**：stdout EOF 后必须 `proc.wait(timeout=10)` 再取码——CUDA 清理可能延后于管道关闭，直接 `poll()` 会误报 -1 失败（v2.0 修复）
+- 用户 Stop：终止当前进程 + 清空剩余队列，批次标记停止
+- 全部完成后 App 读取各 run 的 `results.csv` 末行输出对比表（`core.read_results_summary`）
 
 ## 5. 必须知道的坑（都是实测踩过的）
 
@@ -148,13 +157,18 @@ v1.1 起 `core.find_python_exe()` 自动探测解释器，优先级：
 
 ### ④ ultralytics save_txt 只为有检出的图生成 txt
 没检出目标的图片没有 txt 文件——这是正常行为不是 bug。
-这些图在⑥最终划分时被跳过并列出清单（≤10 条明细）。
+v2.0 起页签⑥可选「无检出图片当背景图纳入」：生成 0 字节空 txt 一并复制进
+final_dataset（YOLO 视空标签为纯背景负样本）；风险：漏检的目标会被教成背景。
 
 ### ⑤ tqdm 进度条刷屏
 ultralytics 训练输出带 `%|` 的 `\r` 刷新行，`_poll()` 里已过滤只保留有效日志。
 
 ### ⑥ GBK 控制台 UnicodeEncodeError
 独立命令行跑 tool_core.py 时中文符号可能打不出，`log()` 已做 gbk replace 降级，不会炸任务。
+
+### ⑦ 退出码误报（v2.0 已修复）
+子进程 stdout 关闭（EOF）早于进程真正退出（CUDA 清理延后），EOF 后直接 `poll()` 返回
+None → 误报 exit=-1「失败」。必须 `wait(timeout=10)` 等进程结束再取码（见 §4.4）。
 
 ## 6. 运行时产物目录结构
 
@@ -188,7 +202,7 @@ P:\
 | 任务运行中关窗 | askokcancel 确认后终止任务退出 |
 | 比例和 >100% | 点击即弹错，不发任务 |
 
-## 8. 测试情况（2026-08-26 实测通过）
+## 8. 测试情况（v2.0 全量实测通过）
 
 - 语法编译 ✅；核心函数单测 ✅
 - 抽帧：中文名视频 @25fps 源 @5fps 抽取 → 15 张正确命名落盘 ✅
@@ -198,22 +212,19 @@ P:\
 - 预测链路 → predict_out 结构正确，空检出时回填 0 属预期 ✅
 - JobRunner 子进程：流式日志、退出回调、Stop 终止（stopped_by_user=True）✅
 - config.json 往返持久化 ✅；GUI 冒烟（7页签构建）✅
+- **v2.0** 多模型排队（2模型各1epoch 实测31~36s 串行完成，exit 全 0）✅
+- **v2.0** 对比汇总表（mAP50/mAP50-95/用时，失败行标注"失败/未完成"）✅
+- **v2.0** 相似帧去重（75帧视频 → 去重后仅2张，阈值99%）✅
+- **v2.0** 背景图纳入（10图6标4空 → 全部进 final_dataset 且 label 配对）✅
+- **v2.0** v1→v2 config 迁移（model 单值→models 列表）、最近项目历史、数量预览 ✅
 
-## 9. 已知限制 / 未做功能（经用户确认暂缓）
+## 9. 已知限制 / 未做功能
 
-以下在需求讨论中确认过价值，但用户决定先交付 1.0，完整方案见
-`C:\Users\muwen\.claude\plans\yolo-tool-plan-v2-enhancements.md`：
-
-- 多模型排队对比训练 + mAP 汇总表（当前一次只能训一个模型）
-- 相似帧去重开关（减少重复标注量）
-- 无检出图片当背景图纳入的可选项（当前一律跳过）
-- 数量实时预览、最近项目历史下拉
-- 断点续训、完成提醒/自动关机、日志落盘（明确不做）
-
-其他限制：
-- 单项目单任务：同一时刻只能跑一个重活（互斥锁设计如此）
+- 单项目单任务：同一时刻只能跑一个**任务队列**（多模型排队算一个队列，内部串行）
 - `cache=ram` 默认关：大数据集会 OOM，勾选前确认内存充足
 - imgsz 默认 224 是用户习惯值（小目标场景可自行调大）
+- 多模型对比仅报告 mAP 数值，不自动绘制对比图（结果目录有各模型独立曲线，可自行比对）
+- 相似帧去重阈值 100% 时行为 ≈ 不去重（仅跳过完全相同帧）
 
 ## 10. 常见问题排查
 
@@ -247,4 +258,4 @@ P:\
 ## 12. Git 仓库说明
 
 - 仓库位置即工具目录；`.gitignore` 排除 `__pycache__/`、`*.pt`（大文件不入库，见 §2 部署说明）、`config.json`（含个人路径）
-- 首次提交 tag：`v1.0`；自动探测更新：`v1.1`
+- tag 历史：`v1.0`（基础版）→ `v1.1`（环境自动探测）→ `v2.0`（多模型对比/去重/背景图）
