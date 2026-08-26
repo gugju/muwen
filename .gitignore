@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.pyc
+
+# 预训练权重（大文件不入库，部署时单独拷贝，见 TECH_DOC.md §2/§11）
+*.pt
+
+# 个人运行时配置（含本机路径）
+config.json
+config.json.bak
+
+# 运行产物（若在仓库目录内产生）
+images_all/
+dataset/
+final_dataset/
+rest_labels/
+predict_out/
+result/
+
+# 系统
+Thumbs.db
+desktop.ini
