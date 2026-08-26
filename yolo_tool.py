@@ -3,7 +3,7 @@
 """
 YOLO数据集工具箱 —— GUI 主程序
 ================================
-版本: 1.0 (2026-08-26)
+版本: 1.1 (2026-08-26) —— 环境路径自动探测
 运行方式: 用带 ultralytics 的 python 环境执行（推荐双击 启动工具.bat）
 
 七个页签对应完整工作流:
@@ -28,8 +28,9 @@ CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 
 DEFAULT_CONFIG = {
     "version": 1,
-    "python_exe": r"D:\00software\anaconda\envs\yolo\python.exe",
-    "labelimg_exe": r"D:\00software\anaconda\envs\labelimg\Scripts\labelImg.exe",
+    # 环境路径留空 = 首次启动自动探测（find_python_exe / find_labelimg_exe）
+    "python_exe": "",
+    "labelimg_exe": "",
     "project_root": "",
     "classes_text": "gangzhu",
     "tab1": {"video_dir": "", "fps": 5.0},
@@ -52,6 +53,7 @@ class Config:
 
     def load(self):
         if not os.path.isfile(CONFIG_PATH):
+            self.auto_detect()   # 全新机器：默认值空白，自动探测环境
             return
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
@@ -61,12 +63,23 @@ class Config:
                     self.data[k].update(v)   # tab 子字典合并，兼容新增字段
                 else:
                     self.data[k] = v
+            self.auto_detect()   # 配置里缺的环境路径用自动探测补齐
         except Exception:
             # 配置损坏：备份后用默认值
             try:
                 shutil.copy2(CONFIG_PATH, CONFIG_PATH + ".bak")
             except Exception:
                 pass
+            self.auto_detect()
+
+    def auto_detect(self):
+        """python_exe / labelimg_exe 为空时自动探测，让新机器 clone 即用"""
+        if not self.data.get("python_exe"):
+            found = core.find_python_exe()
+            self.data["python_exe"] = found or ""
+        if not self.data.get("labelimg_exe"):
+            found = core.find_labelimg_exe()
+            self.data["labelimg_exe"] = found or ""
 
     def save(self):
         try:
@@ -190,6 +203,23 @@ class App(tk.Tk):
         self.protocol("WM_DELETE_WINDOW", self.on_close)
         self.log("欢迎使用 YOLO 数据集工具箱。请先在顶部选择项目根目录。")
         self.log("流程建议按页签顺序: 抽帧→抽取20%→标注→训练→预测→微调划分→二次训练")
+        self._report_env()
+
+    def _report_env(self):
+        """启动时展示环境探测结果，缺失时给出明确指引"""
+        py = self.cfg["python_exe"]
+        li = self.cfg["labelimg_exe"]
+        if py and os.path.isfile(py):
+            self.log(f"Python 解释器: {py}")
+        else:
+            self.log("[警告] 未找到可用的 Python 解释器，训练/预测将不可用。\n"
+                     "       请修改 config.json 的 python_exe，"
+                     "指向装有 ultralytics 的 python.exe", error=True)
+        if li and os.path.isfile(li):
+            self.log(f"labelImg: {li}")
+        else:
+            self.log("[警告] 未找到 labelImg，标注功能不可用。\n"
+                     "       可在页签③点『自动检测路径』或手动浏览选择", error=True)
 
     # ---------------- 基础设施 ---------------- #
 
@@ -276,14 +306,30 @@ class App(tk.Tk):
         return os.path.join(root, *parts)
 
     def validate_python_exe(self):
+        """验证 python_exe 存在且确实装有 ultralytics（结果缓存，避免反复启动子进程）"""
         py = self.cfg["python_exe"]
         if not py or not os.path.isfile(py):
             messagebox.showerror(
                 "错误", f"Python 解释器不存在:\n{py}\n\n"
-                        "请修改 config.json 里的 python_exe 指向带 ultralytics "
+                        "请修改 config.json 的 python_exe，指向装有 ultralytics "
                         "的 python.exe")
             return False
-        return True
+        if getattr(self, "_py_checked", None) == py:
+            return self._py_ok
+        try:
+            r = subprocess.run(
+                [py, "-c", "import ultralytics"],
+                capture_output=True, timeout=20,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self._py_ok = (r.returncode == 0)
+        except Exception:
+            self._py_ok = False
+        self._py_checked = py
+        if not self._py_ok:
+            messagebox.showerror(
+                "错误", f"该 Python 环境里没有 ultralytics:\n{py}\n\n"
+                        "请修改 config.json 的 python_exe，指向正确的 conda 环境")
+        return self._py_ok
 
     # ---------------- UI 构建 ---------------- #
 

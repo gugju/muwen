@@ -6,7 +6,7 @@
 ![GUI](https://img.shields.io/badge/GUI-tkinter-009688)
 ![Framework](https://img.shields.io/badge/ultralytics-8.4-7B1FA2)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/Version-1.0-brightgreen)
+![Version](https://img.shields.io/badge/Version-1.1-brightgreen)
 
 一个覆盖 **视频抽帧 → 数据划分 → 标注 → 训练 → 半自动预标注 → 微调 → 最终划分 → 二次训练** 完整流程的图形化工具。适合需要反复制作和训练 YOLO 检测数据集的算法工程师，无需手写脚本、手动改路径。
 
@@ -54,12 +54,15 @@ pip install labelimg
 ### 运行
 
 ```bash
-# 方式一：修改 启动工具.bat 中的 PY_EXE 为本机路径后双击
+# 方式一：双击 启动工具.bat（自动探测 python 环境，无需配置）
 # 方式二：命令行
 conda activate yolo
 python yolo_tool.py
 ```
 
+> 环境路径全自动探测（优先名为 `yolo` 的 conda 环境），clone 下来即可运行；
+> 探测失败时 GUI 启动日志会给出明确指引，手动修改 config.json 即可。
+>
 > ⚠️ 若预训练权重（yolov8n.pt 等）不在工具目录，ultralytics 会自动联网下载；
 > 无法联网的环境需手动把 .pt 文件放入工具目录。
 

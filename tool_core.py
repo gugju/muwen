@@ -3,7 +3,7 @@
 """
 YOLO数据集工具箱 —— 核心逻辑层
 =================================
-版本: 1.0 (2026-08-26)
+版本: 1.1 (2026-08-26) —— 环境路径自动探测
 既可被 yolo_tool.py (GUI) 导入复用，也可独立命令行运行：
 
     python tool_core.py --job extract --video_dir X --out_dir Y --fps 5
@@ -77,25 +77,25 @@ def list_images(dir_path):
 
 def find_labelimg_exe(configured=None):
     """
-    三级 fallback 定位 labelImg.exe：
+    自动探测 labelImg.exe（无需用户手动配置）：
       1. config 记录的路径存在则直接用
-      2. 扫描常见 conda 环境 的 Scripts 目录
+      2. CONDA_EXE 推断 + 常见 conda 安装位置的 Scripts 目录
       3. shutil.which 兜底
     都找不到返回 None
     """
     if configured and os.path.isfile(configured):
         return configured
 
-    # 候选 anaconda 根目录：环境变量 CONDA_EXE 推断 + 常见安装位置
     roots = []
     conda_exe = os.environ.get("CONDA_EXE")
     if conda_exe:
-        roots.append(os.path.dirname(os.path.dirname(conda_exe)))  # ...\anaconda
-    roots += [r"D:\00software\anaconda",
-              os.path.expanduser(r"~\anaconda3"),
-              os.path.expanduser(r"~\miniconda3")]
+        roots.append(os.path.dirname(os.path.dirname(conda_exe)))
+    for base in (os.path.expanduser("~"), r"C:\ProgramData", "D:\\", "C:\\"):
+        for name in ("anaconda3", "miniconda3", "Anaconda3", "Miniconda3"):
+            roots.append(os.path.join(base, name))
+    roots.append(r"D:\00software\anaconda")
 
-    for root in roots:
+    for root in dict.fromkeys(roots):   # 去重保序
         for name in ("labelImg.exe", "labelimg.exe"):
             for p in glob.glob(os.path.join(root, "envs", "*", "Scripts", name)):
                 if os.path.isfile(p):
@@ -103,8 +103,50 @@ def find_labelimg_exe(configured=None):
             p = os.path.join(root, "Scripts", name)
             if os.path.isfile(p):
                 return p
-
     return shutil.which("labelImg") or shutil.which("labelimg")
+
+
+def find_python_exe():
+    """
+    自动探测可用的 python.exe（无需用户手动配置），优先带 ultralytics 的 conda 环境：
+      1. CONDA_EXE 推断的 envs/yolo
+      2. 常见 conda 安装位置的 envs/yolo（含 D:\\ 盘位 glob）
+      3. 当前进程解释器 sys.executable（GUI 用什么环境启动就复用哪个）
+      4. conda base
+    返回第一个存在的路径；全部找不到返回 None
+    """
+    candidates = []
+    conda_exe = os.environ.get("CONDA_EXE")
+    if conda_exe:
+        candidates.append(os.path.join(os.path.dirname(os.path.dirname(conda_exe)),
+                                       "envs", "yolo", "python.exe"))
+    for base in (os.path.expanduser("~"), r"C:\ProgramData", "C:\\"):
+        for name in ("anaconda3", "miniconda3", "Anaconda3", "Miniconda3"):
+            candidates.append(os.path.join(base, name, "envs", "yolo", "python.exe"))
+    for drive in ("D:\\", "E:\\"):
+        candidates += glob.glob(os.path.join(drive, "*", "envs", "yolo", "python.exe"))
+
+    if sys.executable and os.path.isfile(sys.executable):
+        exe = sys.executable
+        if exe.lower().endswith("pythonw.exe"):   # GUI 常以 pythonw 启动，子进程统一用 python.exe
+            exe = exe[:-len("pythonw.exe")] + "python.exe"
+        candidates.append(exe)
+
+    if conda_exe and os.path.isfile(conda_exe):
+        candidates.append(conda_exe)
+    for base in (os.path.expanduser("~"), r"C:\ProgramData", "C:\\"):
+        for name in ("anaconda3", "miniconda3", "Anaconda3", "Miniconda3"):
+            candidates.append(os.path.join(base, name, "python.exe"))
+
+    seen = set()
+    for p in candidates:
+        p = os.path.normpath(p)
+        if p in seen:
+            continue
+        seen.add(p)
+        if os.path.isfile(p):
+            return p
+    return None
 
 
 # ---------------------------------------------------------------- #

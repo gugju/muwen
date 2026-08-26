@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **版本** | 1.0（2026-08-26） |
+| **版本** | 1.1（2026-08-26）—— 新增环境路径自动探测 |
 | **作者** | muwen（由 Claude Code 协助开发） |
 | **用途** | 一站式 YOLO 检测数据集制作 + 训练 GUI 工具 |
 | **技术栈** | Python 3.11 / tkinter / ultralytics 8.4.49 / OpenCV 4.11 |
@@ -129,14 +129,22 @@ np.fromfile(path, np.uint8) → cv2.imdecode(...)  # 读
 ```
 用户的目录全是中文名，绕过封装直接用 imwrite 整个工具就废了。
 
-### ② 系统 PATH 的 python 不是训练环境
-`python` 命令指向 Python 3.13，**没有 ultralytics**。
-一切训练/预测子进程必须显式用 `D:\00software\anaconda\envs\yolo\python.exe`
-（记录在 config.json 的 `python_exe`）。
+### ② 系统 PATH 的 python 不是训练环境（v1.1 已自动探测）
+`python` 命令可能指向不带 ultralytics 的 Python。
+v1.1 起 `core.find_python_exe()` 自动探测解释器，优先级：
+1. `CONDA_EXE` 推断的 `envs/yolo`
+2. 常见 conda 安装位置的 `envs/yolo`（含 D:\ 盘位 glob）
+3. 当前进程解释器 `sys.executable`（GUI 用什么环境启动就复用哪个，pythonw 自动转 python.exe）
+4. conda base
 
-### ③ labelImg 不在 PATH
-实际位置 `D:\00software\anaconda\envs\labelimg\Scripts\labelImg.exe`。
-`core.find_labelimg_exe()` 三级 fallback：config 记录路径 → 扫描各 conda env 的 Scripts → shutil.which。
+探测结果写入 config.json 的 `python_exe`；GUI 启动时在日志区展示。
+`validate_python_exe()` 会在训练前**实际运行 `import ultralytics` 验证**（带缓存），
+环境不对会给出明确报错而不是等训练才失败。
+
+### ③ labelImg 不在 PATH（v1.1 已自动探测）
+`core.find_labelimg_exe()` 探测链：config 记录路径 → CONDA_EXE 推断 +
+常见 conda 安装位置（含 D:\00software\anaconda）下扫描各 env 的 Scripts → shutil.which。
+找不到时 GUI 启动日志会提示，可在页签③「自动检测路径」或手动浏览选择。
 
 ### ④ ultralytics save_txt 只为有检出的图生成 txt
 没检出目标的图片没有 txt 文件——这是正常行为不是 bug。
@@ -218,20 +226,25 @@ P:\
 | 训练中途想停 | 对应页签「停止训练」按钮；terminate 后 3 秒强杀 |
 | config.json 坏了 | 删掉重启即可，程序自动备份损坏文件为 .bak 并重建默认 |
 
-## 11. 部署到新机器
+## 11. 部署到新机器（v1.1 起基本零配置）
 
-1. 安装 Miniconda/Anaconda，创建环境并装包：
+1. 安装 Miniconda/Anaconda，创建环境并装包（**环境名建议用 yolo**，自动探测默认找它）：
    ```bash
    conda create -n yolo python=3.11 -y
    conda activate yolo
    pip install ultralytics opencv-python
    ```
-2. 另建 labelimg 环境：`pip install labelimg`（或改用系统 PATH 能找到的安装方式）
+2. 另建 labelimg 环境：`pip install labelimg`（环境名随意，自动探测会扫所有 envs）
 3. 拷贝整个工具文件夹；把预训练 .pt 权重放进同目录
-4. 修改 `启动工具.bat` 里的 `PY_EXE` 和 `config.json` 里的 `python_exe` / `labelimg_exe` 为新机器路径
-5. 双击 bat 启动验证
+4. 双击 `启动工具.bat` —— 自动探测 python（找不到才需手动改 bat 候选路径）；
+   GUI 启动时自动探测 python_exe 与 labelimg_exe 并写入 config.json，日志区可见
+5. 若自动探测失败（环境装在奇怪位置）：手动改 `config.json` 的
+   `python_exe` / `labelimg_exe`，或页签③「自动检测路径」
+
+> 约定：探测默认找名为 **yolo** 的 conda 环境；不想改环境名的话
+> 直接手动配 config.json 即可，探测结果不会覆盖用户已填写的路径。
 
 ## 12. Git 仓库说明
 
 - 仓库位置即工具目录；`.gitignore` 排除 `__pycache__/`、`*.pt`（大文件不入库，见 §2 部署说明）、`config.json`（含个人路径）
-- 首次提交 tag：`v1.0`
+- 首次提交 tag：`v1.0`；自动探测更新：`v1.1`
