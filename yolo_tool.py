@@ -3,7 +3,7 @@
 """
 YOLO数据集工具箱 —— GUI 主程序
 ================================
-版本: 2.0 (2026-08-26) —— 多模型对比训练/抽帧去重/背景图/便利功能
+版本: 3.0 (2026-08-26) —— 训练高级参数可调
 运行方式: 用带 ultralytics 的 python 环境执行（推荐双击 启动工具.bat）
 
 七个页签对应完整工作流:
@@ -39,11 +39,19 @@ DEFAULT_CONFIG = {
              "dedup_on": False, "dedup_threshold": 90},
     "tab2": {"sample_ratio": 0.2, "inner_train_ratio": 0.7},
     "tab4": {"models": ["yolov8n.pt"], "epochs": 300, "imgsz": 224, "batch": 32,
-             "patience": 50, "copy_paste": 0.3, "workers": 2, "cache_ram": False},
+             "patience": 50, "copy_paste": 0.3, "workers": 2, "cache_ram": False,
+             "adv_show": False,
+             "adv": {"lr0": "", "lrf": "", "weight_decay": "", "mosaic": "",
+                     "fliplr": "", "degrees": "", "cos_lr": True,
+                     "device": "", "seed": ""}},
     "tab5": {"conf": 0.25},
     "tab6": {"r_train": 0.7, "r_val": 0.2, "empty_bg": False},
     "tab7": {"models": ["yolov8n.pt"], "epochs": 300, "imgsz": 224, "batch": 32,
-             "patience": 50, "copy_paste": 0.3, "workers": 2, "cache_ram": False},
+             "patience": 50, "copy_paste": 0.3, "workers": 2, "cache_ram": False,
+             "adv_show": False,
+             "adv": {"lr0": "", "lrf": "", "weight_decay": "", "mosaic": "",
+                     "fliplr": "", "degrees": "", "cos_lr": True,
+                     "device": "", "seed": ""}},
 }
 
 # 预设模型下拉值（多选）
@@ -265,6 +273,7 @@ class App(tk.Tk):
         self.start_buttons = []          # 所有需要互斥禁用的按钮
         self.stop_buttons = {}           # name -> button
         self.train_tabs_meta = {}        # tab4/tab7 -> yaml kind
+        self._adv_frames = {}            # tab4/tab7 -> (高级选项frame, 展开状态var)
         self._last_save_dir = ""
         self._on_done_hook = None
         self._train_batch = None         # 多模型对比: [{model, save_dir, elapsed}]
@@ -327,6 +336,7 @@ class App(tk.Tk):
             v = getattr(self, f"{key}_vars", None)
             if v is None:
                 continue
+            adv, _ = self._collect_adv(v)
             c[key].update({
                 "models": self._collect_models(v),
                 "epochs": int(v["epochs"].get()),
@@ -335,7 +345,9 @@ class App(tk.Tk):
                 "patience": int(v["patience"].get()),
                 "copy_paste": float(v["copy_paste"].get()),
                 "workers": int(v["workers"].get()),
-                "cache_ram": bool(v["cache"].get())})
+                "cache_ram": bool(v["cache"].get()),
+                "adv_show": bool(v["adv_show"].get()),
+                "adv": adv})
         c["tab5"].update({"conf": float(self.var_conf.get())})
         c["tab6"].update({"r_train": float(self.var_rtrain.get()),
                           "r_val": float(self.var_rval.get()),
@@ -377,6 +389,13 @@ class App(tk.Tk):
                       "copy_paste", "workers"):
                 v[k].set(t.get(k, DEFAULT_CONFIG[key][k]))
             v["cache"].set(bool(t.get("cache_ram", False)))
+            # 高级选项（旧配置无 adv 字段时用默认空值）
+            adv_cfg = t.get("adv", {}) or {}
+            for k, var in v["adv"].items():
+                var.set(adv_cfg.get(k, ""))
+            v["adv_cos"].set(bool(adv_cfg.get("cos_lr", True)))
+            v["adv_show"].set(bool(t.get("adv_show", False)))
+            self._toggle_adv(key, v["adv_show"].get())
         self.var_conf.set(c["tab5"]["conf"])
         t6 = c["tab6"]
         self.var_rtrain.set(t6["r_train"])
@@ -811,6 +830,49 @@ class App(tk.Tk):
         ttk.Checkbutton(cache_row, text="启用 cache=ram（更快，但数据集大时可能内存不足）",
                         variable=v_cache).pack(side=tk.LEFT)
 
+        # —— 高级选项（默认收起，展开可调学习率/增强/设备等，留空=用默认）——
+        # holder 固定占位，展开/收起只动内部，不影响页签其他区域布局
+        adv_holder = ttk.Frame(lf)
+        adv_holder.pack(fill=tk.X, pady=(4, 0))
+        var_adv_show = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            adv_holder,
+            text="☰ 高级选项（学习率/数据增强/设备等，留空使用默认值）",
+            variable=var_adv_show,
+            command=lambda: self._toggle_adv(key, var_adv_show.get())
+        ).pack(anchor=tk.W)
+        adv_frame = ttk.LabelFrame(adv_holder,
+                                   text="高级参数（留空 = 使用 ultralytics 默认值）",
+                                   padding=6)
+        adv_grid = ttk.Frame(adv_frame)
+        adv_grid.pack(fill=tk.X)
+
+        def add_adv(label, tip):
+            var = tk.StringVar()
+            row = ttk.Frame(adv_grid)
+            ttk.Label(row, text=label, width=16).pack(side=tk.LEFT)
+            ttk.Entry(row, textvariable=var, width=12).pack(side=tk.LEFT)
+            ttk.Label(row, text=tip, foreground="#666").pack(side=tk.LEFT, padx=4)
+            row.pack(fill=tk.X, pady=1)
+            return var
+
+        adv_vars = {}
+        adv_vars["lr0"] = add_adv("lr0 初始学习率:", "默认 0.01")
+        adv_vars["lrf"] = add_adv("lrf 终值学习率:", "默认 0.01")
+        adv_vars["weight_decay"] = add_adv("weight_decay:", "权重衰减, 默认 0.0005")
+        adv_vars["mosaic"] = add_adv("mosaic:", "马赛克增强 0~1, 默认 1.0")
+        adv_vars["fliplr"] = add_adv("fliplr:", "水平翻转概率, 默认 0.5")
+        adv_vars["degrees"] = add_adv("degrees:", "随机旋转角度, 默认 0.0")
+        adv_vars["device"] = add_adv("device 设备:", "GPU编号如 0 / 0,1, 留空自动")
+        adv_vars["seed"] = add_adv("seed 随机种子:", "默认 0")
+
+        adv_cos_row = ttk.Frame(adv_grid)
+        adv_cos = tk.BooleanVar(value=True)
+        ttk.Checkbutton(adv_cos_row, text="cos_lr 余弦退火调度 (默认开启)",
+                        variable=adv_cos).pack(side=tk.LEFT)
+        adv_cos_row.pack(fill=tk.X, pady=1)
+        self._adv_frames[key] = (adv_frame, var_adv_show)
+
         yrow = ttk.Frame(lf)
         yrow.pack(fill=tk.X, pady=2)
         ttk.Label(yrow, text="数据集配置:").pack(side=tk.LEFT)
@@ -835,9 +897,53 @@ class App(tk.Tk):
             "model_cbs": model_cbs, "custom": var_custom,
             "epochs": v_epochs, "imgsz": v_imgsz,
             "batch": v_batch, "patience": v_patience, "copy_paste": v_cp,
-            "workers": v_workers, "cache": v_cache, "yaml": var_yaml})
+            "workers": v_workers, "cache": v_cache, "yaml": var_yaml,
+            "adv_show": var_adv_show, "adv": adv_vars, "adv_cos": adv_cos})
         btn_start.configure(command=lambda: self.on_train(key))
         self.train_tabs_meta[key] = yaml_kind
+
+    def _toggle_adv(self, key, show):
+        """高级选项区 展开/收起"""
+        adv_frame, _ = self._adv_frames[key]
+        if show:
+            adv_frame.pack(fill=tk.X, pady=(4, 0))
+        else:
+            adv_frame.pack_forget()
+
+    def _collect_adv(self, v):
+        """收集高级参数 dict；数值留空=不传(用默认)，填了才带上。返回 (adv, 错误信息)"""
+        adv = {}
+        for k, var in v["adv"].items():
+            s = var.get().strip()
+            if not s:
+                continue
+            try:
+                if k == "device":
+                    adv[k] = s
+                elif k == "seed":
+                    adv[k] = int(s)
+                else:
+                    adv[k] = float(s)
+            except ValueError:
+                return None, f"{k} 不是合法数值: {s}"
+        if v["adv_cos"].get():
+            adv["cos_lr"] = True
+        else:
+            adv["cos_lr"] = False
+        return adv, None
+
+    def _adv_cmd_args(self, adv):
+        """高级参数字典 → 命令行参数列表（值为 None/空的字段不传，用默认）"""
+        args = []
+        for k in ("lr0", "lrf", "weight_decay", "mosaic", "fliplr", "degrees",
+                  "device", "seed"):
+            val = adv.get(k)
+            if val is None or val == "":
+                continue
+            args += [f"--{k}", str(val)]
+        if "cos_lr" in adv:
+            args += ["--cos_lr", "1" if adv["cos_lr"] else "0"]
+        return args
 
     def _collect_models(self, v):
         """收集勾选的预设模型 + 自定义输入，去重保序"""
@@ -939,6 +1045,11 @@ class App(tk.Tk):
         if not models:
             messagebox.showerror("错误", "请至少勾选一个模型，或在自定义栏填写模型名")
             return
+        adv, adv_err = self._collect_adv(v)
+        if adv_err:
+            messagebox.showerror("错误", f"高级参数格式错误:\n{adv_err}\n\n"
+                                         "数值类请填数字（如 0.01），留空则使用默认值")
+            return
         self.save_config_from_widgets()
         # 多模型对比批次记录
         self._train_batch = [{"model": m, "save_dir": "", "elapsed": 0.0,
@@ -948,6 +1059,7 @@ class App(tk.Tk):
         self.set_busy(True, key)
         self.log(f"▶ 加入训练队列 {len(models)} 个模型: {', '.join(models)}")
         self.log(f"  数据集: {yaml_path}")
+        adv_args = self._adv_cmd_args(adv)
         for i, model in enumerate(models, 1):
             cmd = [self.cfg["python_exe"],
                    os.path.join(APP_DIR, "tool_core.py"),
@@ -961,6 +1073,7 @@ class App(tk.Tk):
                    "--copy_paste", str(v["copy_paste"].get()),
                    "--workers", str(v["workers"].get()),
                    "--cache_ram", "1" if v["cache"].get() else "0"]
+            cmd += adv_args
             self.runner.start(cmd, desc=f"训练 {model} ({i}/{len(models)})",
                               on_done=self._on_train_job_done)
 

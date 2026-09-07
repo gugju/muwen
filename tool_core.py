@@ -3,7 +3,7 @@
 """
 YOLO数据集工具箱 —— 核心逻辑层
 =================================
-版本: 2.0 (2026-08-26) —— 多模型对比训练/抽帧去重/背景图/便利功能
+版本: 3.0 (2026-08-26) —— 训练高级参数可调
 既可被 yolo_tool.py (GUI) 导入复用，也可独立命令行运行：
 
     python tool_core.py --job extract --video_dir X --out_dir Y --fps 5
@@ -518,8 +518,13 @@ def build_yaml(dataset_root, names, out_path):
 # ---------------------------------------------------------------- #
 
 def run_train(data, model, project_root, epochs=300, imgsz=224, batch=32,
-              patience=50, copy_paste=0.3, workers=2, cache_ram=False):
-    """调用 ultralytics 训练一个模型，返回实际保存目录"""
+              patience=50, copy_paste=0.3, workers=2, cache_ram=False,
+              **adv):
+    """
+    调用 ultralytics 训练一个模型，返回实际保存目录。
+    adv 为可选高级参数 dict（lr0/lrf/weight_decay/mosaic/fliplr/degrees/
+    cos_lr/device/seed 等），值为 None 的不传给 ultralytics → 使用其默认。
+    """
     os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
     if not os.path.isfile(data):
         raise JobError(f"数据集 yaml 不存在: {data}")
@@ -530,10 +535,16 @@ def run_train(data, model, project_root, epochs=300, imgsz=224, batch=32,
                   workers=workers)
     if cache_ram:
         kwargs["cache"] = "ram"
+    for k, v in adv.items():
+        if v is not None:
+            kwargs[k] = v
 
     project = os.path.join(project_root, "result")
     name = os.path.splitext(os.path.basename(model))[0] or "model"
     log(f"＝ 开始训练: {model}  (epochs={epochs}, imgsz={imgsz}, batch={batch})")
+    adv_txt = ", ".join(f"{k}={v}" for k, v in adv.items() if v is not None)
+    if adv_txt:
+        log(f"  高级参数: {adv_txt}")
     y = YOLO(model)
     y.train(project=project, name=name, **kwargs)
     save_dir = getattr(getattr(y, "trainer", None), "save_dir", "") or \
@@ -648,6 +659,16 @@ def main():
     g2.add_argument("--copy_paste", type=float, default=0.3)
     g2.add_argument("--workers", type=int, default=2)
     g2.add_argument("--cache_ram", type=int, default=0)
+    # —— 高级参数（缺省 None = 不传，ultralytics 用默认）——
+    g2.add_argument("--lr0", type=float, default=None)
+    g2.add_argument("--lrf", type=float, default=None)
+    g2.add_argument("--weight_decay", type=float, default=None)
+    g2.add_argument("--mosaic", type=float, default=None)
+    g2.add_argument("--fliplr", type=float, default=None)
+    g2.add_argument("--degrees", type=float, default=None)
+    g2.add_argument("--cos_lr", type=int, default=None)
+    g2.add_argument("--device", default=None)
+    g2.add_argument("--seed", type=int, default=None)
 
     g3 = ap.add_argument_group("predict")
     g3.add_argument("--weights")
@@ -668,10 +689,21 @@ def main():
         elif args.job == "train":
             if not args.data or not args.project_root:
                 raise JobError("train 需要 --data 和 --project_root")
+            adv = {}
+            for k in ("lr0", "lrf", "weight_decay", "mosaic",
+                      "fliplr", "degrees", "device"):
+                v = getattr(args, k)
+                if v is not None:
+                    adv[k] = v
+            if args.cos_lr is not None:
+                adv["cos_lr"] = bool(args.cos_lr)
+            if args.seed is not None:
+                adv["seed"] = args.seed
             run_train(args.data, args.model, args.project_root,
                       epochs=args.epochs, imgsz=args.imgsz, batch=args.batch,
                       patience=args.patience, copy_paste=args.copy_paste,
-                      workers=args.workers, cache_ram=bool(args.cache_ram))
+                      workers=args.workers, cache_ram=bool(args.cache_ram),
+                      **adv)
         elif args.job == "predict":
             if not args.weights or not args.source or not args.project:
                 raise JobError("predict 需要 --weights --source --project")

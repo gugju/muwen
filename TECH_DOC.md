@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **版本** | 2.0（2026-08-26）—— 多模型对比/去重/背景图/便利功能 |
+| **版本** | 3.0（2026-08-26）—— 训练高级参数可调 |
 | **作者** | muwen（由 Claude Code 协助开发） |
 | **用途** | 一站式 YOLO 检测数据集制作 + 训练 GUI 工具 |
 | **技术栈** | Python 3.11 / tkinter / ultralytics 8.4.49 / OpenCV 4.11 |
@@ -127,6 +127,23 @@ stdout 行协议：
 - 用户 Stop：终止当前进程 + 清空剩余队列，批次标记停止
 - 全部完成后 App 读取各 run 的 `results.csv` 末行输出对比表（`core.read_results_summary`）
 
+### 4.3 训练参数体系（v3.0）
+
+页签④/⑦的「训练参数」区分两层：
+
+**基础参数（始终可见）**：epochs / imgsz / batch / patience / copy_paste / workers / cache=ram
+
+**高级选项（☰ 默认收起，点击展开）**：lr0、lrf、weight_decay、mosaic、
+fliplr、degrees、cos_lr（复选框）、device、seed。
+- 数值输入框**留空 = 不传参** → ultralytics 用内置默认值
+- 只有填了值的字段才拼进子进程命令行（`--lr0 0.001` 等）
+- `cos_lr` 是复选框，始终传递（勾=1/不勾=0，ultralytics 默认开启）
+- 展开状态与填入值都记忆在 config.json（tab4/tab7 的 `adv_show` / `adv`）
+
+取值经 `App._collect_adv()` 校验（非数值即拦截弹窗）→ `_adv_cmd_args()` 拼命令行 →
+`tool_core.run_train(**adv)` 把非 None 项并入 `model.train()` kwargs。
+注意 argparse 的 `--device` 保持字符串（如 `0,1`），其余数值转 int/float。
+
 ## 5. 必须知道的坑（都是实测踩过的）
 
 ### ① cv2 中文路径静默失败 ⚠️ 最重要
@@ -217,6 +234,11 @@ P:\
 - **v2.0** 相似帧去重（75帧视频 → 去重后仅2张，阈值99%）✅
 - **v2.0** 背景图纳入（10图6标4空 → 全部进 final_dataset 且 label 配对）✅
 - **v2.0** v1→v2 config 迁移（model 单值→models 列表）、最近项目历史、数量预览 ✅
+- **v3.0** 高级选项 UI：展开/收起、8 个参数输入 + cos_lr 复选框 ✅
+- **v3.0** 留空不传参（weight_decay/lrf 留空 → 命令行无对应参数）✅
+- **v3.0** 非法输入拦截（lr0=abc → 弹窗提示不启动）✅
+- **v3.0** 展开状态 + 填值跨会话持久化往返 ✅
+- **v3.0** 真实训练传参（lr0=0.001/mosaic=0.5/cos_lr=0/seed=7 全部生效）✅
 
 ## 9. 已知限制 / 未做功能
 
@@ -258,4 +280,4 @@ P:\
 ## 12. Git 仓库说明
 
 - 仓库位置即工具目录；`.gitignore` 排除 `__pycache__/`、`*.pt`（大文件不入库，见 §2 部署说明）、`config.json`（含个人路径）
-- tag 历史：`v1.0`（基础版）→ `v1.1`（环境自动探测）→ `v2.0`（多模型对比/去重/背景图）
+- tag 历史：`v1.0`（基础版）→ `v1.1`（环境自动探测）→ `v2.0`（多模型对比/去重/背景图）→ `v3.0`（训练高级参数）
