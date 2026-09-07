@@ -6,7 +6,7 @@
 ![GUI](https://img.shields.io/badge/GUI-tkinter-009688)
 ![Framework](https://img.shields.io/badge/ultralytics-8.4-7B1FA2)
 ![Platform](https://img.shields.io/badge/Platform-Windows%2010%2F11-blue)
-![Version](https://img.shields.io/badge/Version-3.0-brightgreen)
+![Version](https://img.shields.io/badge/Version-3.1-brightgreen)
 
 一个覆盖 **视频抽帧 → 数据划分 → 标注 → 训练 → 半自动预标注 → 微调 → 最终划分 → 二次训练** 完整流程的图形化工具。适合需要反复制作和训练 YOLO 检测数据集的算法工程师，无需手写脚本、手动改路径。
 
@@ -15,7 +15,7 @@
 - 🖥️ **图形界面**：7 个页签对应完整工作流，中文界面，零代码操作
 - 📹 **视频抽帧**：按每秒 N 帧采样，支持**相似帧去重**（跳过几乎相同的帧，减少重复标注量），自动处理中文文件名/路径
 - 🏷️ **半自动标注**：先用少量数据训练初版模型，再自动预测剩余图片生成标注框，人工只需微调
-- 🤖 **一键训练**：**多模型排队对比训练**（勾选多个模型顺序训练，结束后自动输出 mAP 对比汇总表）；训练参数图形化配置——基础参数（epochs/imgsz/batch 等）+ **高级选项**（点开可调学习率 lr0/lrf、数据增强 mosaic/fliplr/degrees、权重衰减、cos_lr、device、seed，留空用默认值）；后台子进程运行，可随时停止
+- 🤖 **一键训练**：**多模型排队对比训练**（勾选多个模型顺序训练，结束后自动输出 mAP 对比汇总表）；训练参数图形化配置——基础参数（epochs/imgsz/batch 等）+ **高级选项**（点开可调学习率 lr0/lrf、数据增强 mosaic/fliplr/degrees、权重衰减、cos_lr、device、seed，每个参数带 **❓ 悬停详细中文介绍**，留空用默认值）；后台子进程运行，可随时停止
 - 🗂️ **数据集管理**：20% 抽取、70/30、70/20/10 划分自动完成；**无检出图片可选当背景图纳入**（提升精确率）；防呆设计防误操作
 - 💾 **参数记忆**：所有路径与参数自动保存，项目根目录记住最近 5 个，下次打开不用重填
 - 📊 **数量实时预览**：设置比例时立即显示预计张数

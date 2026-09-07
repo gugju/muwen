@@ -3,7 +3,7 @@
 """
 YOLO数据集工具箱 —— GUI 主程序
 ================================
-版本: 3.0 (2026-08-26) —— 训练高级参数可调
+版本: 3.1 (2026-08-26) —— 高级参数悬停介绍
 运行方式: 用带 ultralytics 的 python 环境执行（推荐双击 启动工具.bat）
 
 七个页签对应完整工作流:
@@ -56,6 +56,59 @@ DEFAULT_CONFIG = {
 
 # 预设模型下拉值（多选）
 PRESET_MODELS = ["yolov8n.pt", "yolov8s.pt", "yolo11n.pt", "yolo11s.pt"]
+
+# 高级参数详细说明（v3.1：悬停 ❓ 显示）
+ADV_DESCRIPTIONS = {
+    "lr0": "【初始学习率】\n"
+           "每次更新权重的步长，最关键的调参项之一。\n"
+           "· 太大(>0.05)：loss 震荡不收敛，甚至发散\n"
+           "· 太小(<0.0001)：收敛极慢，且易陷入局部最优\n"
+           "· 建议：用预训练权重微调常用 0.01；从头训练或小数据集\n"
+           "  可降到 0.001~0.005；数据集很小(几十张)时 0.0005 更稳",
+    "lrf": "【终值学习率系数】\n"
+           "训练结束时学习率降到多少，最终 lr = lr0 × lrf。\n"
+           "· 默认 0.01 = 结束时降为初始的 1/100\n"
+           "· 越大说明结束时的学习率越高，后期调参幅度大\n"
+           "· 一般保持默认即可，通常无需修改",
+    "weight_decay": "【权重衰减 / L2 正则化】\n"
+                    "惩罚过大权重，抑制过拟合。\n"
+                    "· 默认 0.0005 适合大多数场景\n"
+                    "· 数据量少、容易过拟合时调大(0.001~0.005)\n"
+                    "· 欠拟合(训练/验证损失都高)时可调小甚至归零",
+    "mosaic": "【马赛克增强】\n"
+              "把 4 张图拼成 1 张训练，大幅增加样本多样性，\n"
+              "提升小目标和遮挡场景的鲁棒性。\n"
+              "· 默认 1.0（每个 batch 都做）\n"
+              "· 数据集本身很小(≤几百张)或目标密集难分时，\n"
+              "  建议降到 0.5 或 0，否则合成图太乱影响学习\n"
+              "· ultralytics 会在最后 10 个 epoch 自动关闭它",
+    "fliplr": "【水平翻转增强】\n"
+              "随机水平镜像的概率（0~1）。\n"
+              "· 默认 0.5 = 一半图片翻转，通用增强手段\n"
+              "· 若目标有左右语义（如车牌文字、方向箭头、\n"
+              "  左右不对称部件），必须设为 0 防止学错方向",
+    "degrees": "【随机旋转增强】\n"
+               "图片随机旋转的角度范围（度）。\n"
+               "· 默认 0 = 不旋转\n"
+               "· 目标姿态多变时设 5~30，帮助模型学旋转不变性\n"
+               "· 注意：旋转会带来框的噪声，数值不宜过大；\n"
+               "  若检测物有明确上下(如文字)则保持 0",
+    "cos_lr": "【余弦退火学习率调度】\n"
+              "学习率按余弦曲线从初始值平滑下降到 lrf。\n"
+              "· 相比直线下降，后期衰减更缓慢平缓，收敛通常更稳\n"
+              "· ultralytics 默认开启，一般建议保持勾选\n"
+              "· 个别场景(短训练/实验对比)可取消改为固定线性下降",
+    "device": "【训练设备】\n"
+              "指定用哪块 GPU 或 CPU 训练。\n"
+              "· 0 = 第一块显卡；0,1 = 两张卡并行(需显存够)\n"
+              "· cpu = 用 CPU 训练（非常慢，不推荐）\n"
+              "· 留空 = 自动选择（有 GPU 用 GPU）",
+    "seed": "【随机种子】\n"
+            "固定随机种子后，两次训练的数据打乱/增强顺序一致，\n"
+            "结果可复现，便于做对照实验。\n"
+            "· 默认 0；改一个不同数字 = 换一种随机轨迹\n"
+            "· 做「同一参数跑两次看波动」或论文复现时有用",
+}
 
 
 # ================================================================ #
@@ -129,6 +182,59 @@ class Config:
 
     def __setitem__(self, key, value):
         self.data[key] = value
+
+
+# ================================================================ #
+# 悬停提示 (v3.1: 高级参数说明用, 纯 tkinter 实现)
+# ================================================================ #
+
+class Tooltip:
+    """鼠标悬停 0.5 秒后显示说明气泡，离开即隐藏"""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self.tip_win = None
+        self.after_id = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+
+    def _schedule(self, _e=None):
+        self._cancel()
+        self.after_id = self.widget.after(500, self._show)
+
+    def _show(self):
+        if self.tip_win is not None:
+            return
+        x = self.widget.winfo_rootx() + 18
+        y = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+        self.tip_win = tk.Toplevel(self.widget)
+        self.tip_win.wm_overrideredirect(True)
+        self.tip_win.wm_geometry(f"+{x}+{y}")
+        lbl = tk.Label(self.tip_win, text=self.text, justify=tk.LEFT,
+                       background="#ffffe6", foreground="#222",
+                       relief=tk.SOLID, borderwidth=1,
+                       font=("Microsoft YaHei UI", 9),
+                       wraplength=420, padx=10, pady=8)
+        lbl.pack()
+
+    def _hide(self, _e=None):
+        self._cancel()
+        if self.tip_win is not None:
+            try:
+                self.tip_win.destroy()
+            except Exception:
+                pass
+            self.tip_win = None
+
+    def _cancel(self):
+        if self.after_id is not None:
+            try:
+                self.widget.after_cancel(self.after_id)
+            except Exception:
+                pass
+            self.after_id = None
 
 
 # ================================================================ #
@@ -847,24 +953,32 @@ class App(tk.Tk):
         adv_grid = ttk.Frame(adv_frame)
         adv_grid.pack(fill=tk.X)
 
-        def add_adv(label, tip):
+        def add_adv(key, label, tip):
             var = tk.StringVar()
             row = ttk.Frame(adv_grid)
             ttk.Label(row, text=label, width=16).pack(side=tk.LEFT)
             ttk.Entry(row, textvariable=var, width=12).pack(side=tk.LEFT)
-            ttk.Label(row, text=tip, foreground="#666").pack(side=tk.LEFT, padx=4)
+            # ❓ 悬停查看详细说明 (v3.1)
+            q = ttk.Label(row, text="❓", foreground="#08c",
+                          cursor="question_arrow")
+            q.pack(side=tk.LEFT, padx=(4, 0))
+            Tooltip(q, ADV_DESCRIPTIONS.get(key, ""))
+            ttk.Label(row, text=tip, foreground="#666").pack(
+                side=tk.LEFT, padx=4)
             row.pack(fill=tk.X, pady=1)
             return var
 
         adv_vars = {}
-        adv_vars["lr0"] = add_adv("lr0 初始学习率:", "默认 0.01")
-        adv_vars["lrf"] = add_adv("lrf 终值学习率:", "默认 0.01")
-        adv_vars["weight_decay"] = add_adv("weight_decay:", "权重衰减, 默认 0.0005")
-        adv_vars["mosaic"] = add_adv("mosaic:", "马赛克增强 0~1, 默认 1.0")
-        adv_vars["fliplr"] = add_adv("fliplr:", "水平翻转概率, 默认 0.5")
-        adv_vars["degrees"] = add_adv("degrees:", "随机旋转角度, 默认 0.0")
-        adv_vars["device"] = add_adv("device 设备:", "GPU编号如 0 / 0,1, 留空自动")
-        adv_vars["seed"] = add_adv("seed 随机种子:", "默认 0")
+        adv_vars["lr0"] = add_adv("lr0", "lr0 初始学习率:", "默认 0.01")
+        adv_vars["lrf"] = add_adv("lrf", "lrf 终值学习率:", "默认 0.01")
+        adv_vars["weight_decay"] = add_adv("weight_decay", "weight_decay:",
+                                           "权重衰减, 默认 0.0005")
+        adv_vars["mosaic"] = add_adv("mosaic", "mosaic:", "马赛克增强 0~1, 默认 1.0")
+        adv_vars["fliplr"] = add_adv("fliplr", "fliplr:", "水平翻转概率, 默认 0.5")
+        adv_vars["degrees"] = add_adv("degrees", "degrees:", "随机旋转角度, 默认 0.0")
+        adv_vars["device"] = add_adv("device", "device 设备:",
+                                     "GPU编号如 0 / 0,1, 留空自动")
+        adv_vars["seed"] = add_adv("seed", "seed 随机种子:", "默认 0")
 
         adv_cos_row = ttk.Frame(adv_grid)
         adv_cos = tk.BooleanVar(value=True)
